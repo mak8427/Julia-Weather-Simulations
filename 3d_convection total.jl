@@ -1,303 +1,132 @@
-# ================================================
-# 3D Turbulence Visualization with Oceananigans and GLMakie
-# ================================================
+# Import necessary packages
+using Pkg
+pkg"add Oceananigans, CairoMakie"  # Ensure dependencies are installed
 
-# ---------------------
-# Step 1: Import Necessary Packages
-# ---------------------
-using Oceananigans      # For handling simulation data
-using GLMakie           # For interactive 3D visualization
-using JLD2              # For loading JLD2 files
-using Statistics        # For data manipulation
-using ColorSchemes      # For colormaps
-using Colors            # For Colorant types and macros
+# Import required modules
+using Oceananigans
+using Oceananigans.Units: minutes, hour, hours, day
+using CairoMakie  # For visualization
 
-# ---------------------
-# Step 2: Load Simulation Data
-# ---------------------
+# -----------------------------------
+# GRID SETUP
+# -----------------------------------
+# Create a 2D grid with 64 points in x and z directions, flat in y direction.
+grid = RectilinearGrid(size=(64, 64), extent=(64, 64), halo=(3, 3), topology=(Periodic, Flat, Bounded))
 
-# Path to your JLD2 simulation output file
-jld2_filepath = "3d_turbulence.jld2"
+# The grid is 64x1x64 with 3 halo points for high-order advection accuracy.
+# x is periodic, z is bounded, and y is flat.
+println(grid)
 
-# Load the FieldTimeSeries for ω_mag and E
-ω_mag_timeseries = FieldTimeSeries(jld2_filepath, "ω_mag")
-E_timeseries = FieldTimeSeries(jld2_filepath, "E")
+# -----------------------------------
+# BOUNDARY CONDITIONS
+# -----------------------------------
+# Define time-dependent surface buoyancy flux function that decays over time.
+buoyancy_flux(x, t, params) = params.initial_buoyancy_flux * exp(-t^4 / (24 * params.shut_off_time^4))
+buoyancy_flux_parameters = (initial_buoyancy_flux = 1e-8, shut_off_time = 2hours)
 
-# Access the times at which data was saved
-times = ω_mag_timeseries.times
+# Apply the flux boundary condition at the top of the domain.
+buoyancy_flux_bc = FluxBoundaryCondition(buoyancy_flux, parameters = buoyancy_flux_parameters)
 
-println("Loaded data at times:")
-println(times)
+# Set the buoyancy gradient at the bottom (stabilizing condition).
+N² = 1e-4  # Buoyancy frequency squared (stabilizing).
+buoyancy_gradient_bc = GradientBoundaryCondition(N²)
 
-# ---------------------
-# Step 3: Select Time Index and Extract Data
-# ---------------------
+# Combine the top and bottom boundary conditions into one set.
+buoyancy_bcs = FieldBoundaryConditions(top = buoyancy_flux_bc, bottom = buoyancy_gradient_bc)
 
-# Choose the time index you want to visualize
-# For example, the last time step
-time_index = length(times)
+# -----------------------------------
+# PHOTOPLANKTON DYNAMICS
+# -----------------------------------
+# Define phytoplankton growth as a function of light and grazing by zooplankton.
+growing_and_grazing(x, z, t, P, params) = (params.μ₀ * exp(z / params.λ) - params.m) * P
+plankton_dynamics_parameters = (μ₀ = 1/day, λ = 5, m = 0.1/day)  # Growth and decay rates
 
-# Extract the 3D vorticity magnitude field at the selected time
-ω_mag_field = ω_mag_timeseries[time_index]
+# Create a Forcing object to represent phytoplankton dynamics.
+plankton_dynamics = Forcing(growing_and_grazing, field_dependencies = :P, parameters = plankton_dynamics_parameters)
 
-# Obtain grid coordinates from the field
-xC, yC, zC = nodes(ω_mag_field)
+# -----------------------------------
+# MODEL SETUP
+# -----------------------------------
+# Build the nonhydrostatic model for planktonic convection with the given grid and boundary conditions.
+model = NonhydrostaticModel(; 
+    grid, 
+    advection = UpwindBiasedFifthOrder(),
+    timestepper = :RungeKutta3,
+    closure = ScalarDiffusivity(ν=1e-4, κ=1e-4),  # Viscosity and diffusivity
+    coriolis = FPlane(f=1e-4),  # Coriolis parameter
+    tracers = (:b, :P),  # Tracers: buoyancy (b) and phytoplankton (P)
+    buoyancy = BuoyancyTracer(),
+    forcing = (; P=plankton_dynamics),  # Apply phytoplankton forcing
+    boundary_conditions = (; b=buoyancy_bcs)  # Apply buoyancy boundary conditions
+)
 
-# Convert OffsetArrays to standard arrays for compatibility
-xC = collect(xC)
-yC = collect(yC)
-zC = collect(zC)
+# -----------------------------------
+# INITIAL CONDITIONS
+# -----------------------------------
+# Define initial conditions for buoyancy (b) and phytoplankton (P).
+mixed_layer_depth = 32  # Depth of the mixed layer in meters
+stratification(z) = z < -mixed_layer_depth ? N² * z : - N² * mixed_layer_depth
+noise(z) = 1e-4 * N² * grid.Lz * randn() * exp(z / 4)  # Random noise for initial buoyancy
+initial_buoyancy(x, z) = stratification(z) + noise(z)
 
-# Extract the 3D vorticity magnitude data and convert to a standard array
-ω_mag_data = collect(ω_mag_field[:, :, :])
+# Initialize buoyancy and phytoplankton concentration in the model.
+set!(model, b=initial_buoyancy, P=1)
 
-println("Grid sizes:")
-println("xC: ", length(xC))
-println("yC: ", length(yC))
-println("zC: ", length(zC))
-println("ω_mag_data size: ", size(ω_mag_data))
+# -----------------------------------
+# SIMULATION SETUP
+# -----------------------------------
+# Configure the simulation with a time-step of 2 minutes and a stop time of 24 hours.
+simulation = Simulation(model, Δt=2minutes, stop_time=24hours)
 
-# ---------------------
-# Step 4: Downsample the Data (Optional for Performance)
-# ---------------------
+# Adapt the time-step using a CFL number of 1.0, with a max time-step of 2 minutes.
+conjure_time_step_wizard!(simulation, cfl=1.0, max_Δt=2minutes)
 
-# Define downsampling factor
-# Adjust this based on your system's performance and desired resolution
-downsample_factor = 2  # Use 1 for full resolution, 2 for half, etc.
+# Add a callback to print progress during the simulation.
+using Printf
+progress(sim) = @printf("Iteration: %d, time: %s, Δt: %s\n", iteration(sim), prettytime(sim), prettytime(sim.Δt))
+add_callback!(simulation, progress, IterationInterval(100))
 
-# Downsample grid coordinates
-xC_ds = xC[1:downsample_factor:end]
-yC_ds = yC[1:downsample_factor:end]
-zC_ds = zC[1:downsample_factor:end]
+# -----------------------------------
+# OUTPUT WRITING
+# -----------------------------------
+# Set up an output writer to log velocities and plankton concentration every 20 minutes.
+outputs = (w = model.velocities.w, P = model.tracers.P, avg_P = Average(model.tracers.P, dims=(1, 2)))
+simulation.output_writers[:simple_output] = JLD2OutputWriter(
+    model, outputs, 
+    schedule = TimeInterval(20minutes), 
+    filename = "convecting_plankton.jld2", 
+    overwrite_existing = true
+)
 
-# Downsample vorticity data
-ω_mag_ds = ω_mag_data[1:downsample_factor:end, 1:downsample_factor:end, 1:downsample_factor:end]
+# -----------------------------------
+# RUN THE SIMULATION
+# -----------------------------------
+run!(simulation)
 
-println("Downsampled grid sizes:")
-println("xC_ds: ", length(xC_ds))
-println("yC_ds: ", length(yC_ds))
-println("zC_ds: ", length(zC_ds))
-println("ω_mag_ds size: ", size(ω_mag_ds))
+# -----------------------------------
+# VISUALIZATION (OPTIONAL)
+# -----------------------------------
+# To visualize, load the output file and create a time-series of the results.
+# Extract the w and P fields as matrices to be used in heatmap!
+w_field = interior(w_timeseries[1])  # Extract the interior part of the field (2D data)
+P_field = interior(P_timeseries[1])  # Same for phytoplankton concentration
 
-# ---------------------
-# Step 5: Normalize the Data
-# ---------------------
+# Get the grid points for the x and z coordinates using the appropriate accessor functions
+x_coords = model.grid.x  # x-coordinates of the grid points
+z_coords = model.grid.z  # z-coordinates of the grid points
 
-# Normalize the data for better visualization (scale between 0 and 1)
-ω_mag_normalized = ω_mag_ds ./ maximum(ω_mag_ds)
+# Plotting with CairoMakie
+fig = Figure(size = (1200, 1000))
 
-# ---------------------
-# Step 6: Visualization Functions
-# ---------------------
+# Vertical velocity heatmap
+ax_w = Axis(fig[2, 2]; xlabel = "x (m)", ylabel = "z (m)", aspect = 1)
+hm_w = heatmap!(ax_w, x_coords, z_coords, w_field; colormap = :balance, colorrange = (-maximum(abs, w_field), maximum(abs, w_field)))
+Colorbar(fig[2, 1], hm_w; label = "Vertical velocity (m/s)", flipaxis = false)
 
-# ---------------------
-# Option A: Volume Rendering
-# ---------------------
-# Function for volume rendering
-function volume_rendering(x, y, z, data, current_time)
-    # Create a figure and 3D axis
-    fig = Figure(resolution = (800, 600))
-    ax = Axis3(fig[1, 1],
-               xlabel = "x",
-               ylabel = "y",
-               zlabel = "z",
-               title = "Vorticity Magnitude Volume at time = $(round(current_time, digits=2))")
-    
-    # Create the volume plot
-    volume!(ax, x, y, z, data;
-            algorithm = :absorption,      # Rendering algorithm
-            colormap = :inferno,          # Color scheme
-            transparency = true)          # Enable transparency
-    
-    # Adjust the camera for a better view
-    ax.scene.camera.projection = :perspective
-    cam3d!(ax.scene, eyeposition = Vec3f(2, 2, 2))
-    
-    # Display the figure
-    display(fig)
-    
-    # Save the figure as an image
-    save("vorticity_magnitude_volume_time_$(round(current_time, digits=2)).png", fig)
-end
+# Phytoplankton concentration heatmap
+ax_P = Axis(fig[3, 2]; xlabel = "x (m)", ylabel = "z (m)", aspect = 1)
+hm_P = heatmap!(ax_P, x_coords, z_coords, P_field; colormap = :matter, colorrange = (0.95, 1.1))
+Colorbar(fig[3, 1], hm_P; label = "Phytoplankton concentration", flipaxis = false)
 
-
-# ---------------------
-# Option B: Isosurface Plotting
-# ---------------------
-function isosurface_plotting(x, y, z, data, current_time)
-    # Define isovalue levels (adjust as needed)
-    isovalue_levels = [0.3, 0.5, 0.7]
-    
-    # Create a figure and 3D axis
-    fig = Figure(resolution = (800, 600))
-    ax = Axis3(fig[1, 1],
-               xlabel = "x",
-               ylabel = "y",
-               zlabel = "z",
-               title = "Vorticity Magnitude Isosurfaces at time = $(round(current_time, digits=2))")
-    
-    # Plot isosurfaces
-    for (i, level) in enumerate(isovalue_levels)
-        # Ensure the index is within the range of the colormap
-        colormap_length = length(ColorSchemes.viridis)
-        color_index = clamp(Int(round(Float64(i) * (colormap_length / (length(isovalue_levels) + 1)))), 1, colormap_length)
-        
-        isosurface!(ax, x, y, z, data;
-                    isovalue = level,
-                    color = ColorSchemes.viridis[color_index],
-                    opacity = 0.5)
-    end
-    
-    # Add lighting for better depth perception
-    light!(ax.scene, position = Vec3f(1, 1, 1), color = colorant"#FF0000", intensity = 1.0)
-    
-    # Adjust the camera for a better view
-    ax.camera.projection = :perspective
-    cam3d!(ax.scene, eyeposition = Vec3f(2, 2, 2))
-    
-    # Display the figure
-    display(fig)
-    
-    # Save the figure as an image
-    save("vorticity_magnitude_isosurfaces_time_$(round(current_time, digits=2)).png", fig)
-end
-
-# ---------------------
-# Option C: Slice Plotting
-# ---------------------
-function slice_plotting(x, y, z, data, current_time)
-    # Create a figure and 3D axis
-    fig = Figure(resolution = (800, 600))
-    ax = Axis3(fig[1, 1],
-               xlabel = "x",
-               ylabel = "y",
-               zlabel = "z",
-               title = "Vorticity Magnitude Slices at time = $(round(current_time, digits=2))")
-    
-    # Define slice positions (central slices)
-    x_slice = Int(length(x) ÷ 2)
-    y_slice = Int(length(y) ÷ 2)
-    z_slice = Int(length(z) ÷ 2)
-    
-    # Extract slices
-    slice_x = data[x_slice, :, :]
-    slice_y = data[:, y_slice, :]
-    slice_z = data[:, :, z_slice]
-    
-    # Normalize slices (already normalized globally, but ensure no division by zero)
-    slice_x .= slice_x ./ maximum(slice_x)
-    slice_y .= slice_y ./ maximum(slice_y)
-    slice_z .= slice_z ./ maximum(slice_z)
-    
-    # Create the slices in the 3D plot
-    heatmap!(ax, y, z, slice_x';
-             transform = (:x, x[x_slice]),
-             colormap = :inferno,
-             transparency = true)
-    heatmap!(ax, x, z, slice_y';
-             transform = (:y, y[y_slice]),
-             colormap = :inferno,
-             transparency = true)
-    heatmap!(ax, x, y, slice_z';
-             transform = (:z, z[z_slice]),
-             colormap = :inferno,
-             transparency = true)
-    
-    # Add lighting for better depth perception
-    light!(ax.scene, position = Vec3f(1, 1, 1), color = colorant"red", intensity = 1.0)
-    
-    # Adjust the camera for a better view
-    ax.camera.projection = :perspective
-    cam3d!(ax.scene, eyeposition = Vec3f(2, 2, 2))
-    
-    # Display the figure
-    display(fig)
-    
-    # Save the figure as an image
-    save("vorticity_magnitude_slices_time_$(round(current_time, digits=2)).png", fig)
-end
-
-# ---------------------
-# Step 7: Run Visualization Options
-# ---------------------
-
-# Choose which visualization option to run by uncommenting the desired function call
-
-# Option A: Volume Rendering
-volume_rendering(xC_ds, yC_ds, zC_ds, ω_mag_normalized, times[time_index])
-
-# Option B: Isosurface Plotting
-# isosurface_plotting(xC_ds, yC_ds, zC_ds, ω_mag_normalized, times[time_index])
-
-# Option C: Slice Plotting
-# slice_plotting(xC_ds, yC_ds, zC_ds, ω_mag_normalized, times[time_index])
-
-# ---------------------
-# Step 8: Creating an Animation (Optional)
-# ---------------------
-
-# Uncomment the following block to create an animation of Volume Rendering over time
-
-=begin
-using Oceananigans, GLMakie, JLD2, Statistics
-
-# Define downsampling factor
-downsample_factor = 2  # Adjust based on performance
-
-# Downsample grid coordinates
-xC_ds = xC[1:downsample_factor:end]
-yC_ds = yC[1:downsample_factor:end]
-zC_ds = zC[1:downsample_factor:end]
-
-# Create a figure and 3D axis
-fig = Figure(resolution = (800, 600))
-ax = Axis3(fig[1, 1],
-           xlabel = "x",
-           ylabel = "y",
-           zlabel = "z",
-           title = "Vorticity Magnitude Volume Rendering Over Time")
-
-# Initialize the volume plot with empty data
-initial_volume = NaN * ones(length(xC_ds), length(yC_ds), length(zC_ds))
-volume_plot = volume!(ax, xC_ds, yC_ds, zC_ds, initial_volume;
-                      algorithm = :absorption,
-                      colormap = :inferno,
-                      transparency = true)
-
-# Add lighting for better depth perception
-light!(ax.scene, position = Vec3f(1, 1, 1), color = Colorant"white", intensity = 1.0)
-
-# Adjust the camera for a better view
-ax.camera.projection = :perspective
-cam3d!(ax.scene, eyeposition = Vec3f(2, 2, 2))
-
-# Define the update function for each frame
-function update_volume!(i)
-    @info "Rendering frame $i of $(length(times))"
-    
-    # Extract the 3D data at time index i and downsample
-    ω_mag_field = ω_mag_timeseries[i]
-    ω_mag_data = collect(ω_mag_field[:, :, :])
-    ω_mag_ds = ω_mag_data[1:downsample_factor:end, 1:downsample_factor:end, 1:downsample_factor:end]
-    
-    # Normalize the data
-    ω_mag_normalized = ω_mag_ds ./ maximum(ω_mag_ds)
-    
-    # Update the volume plot data
-    volume_plot[4][] = ω_mag_normalized
-    
-    # Update the title with the current time
-    ax.title = "Vorticity Magnitude Volume at time = $(round(times[i], digits=2))"
-end
-
-# Create the animation by iterating over all time steps
-record(fig, "vorticity_animation.mp4", 1:length(times); framerate = 10) do i
-    update_volume!(i)
-end
-
-@info "Animation saved as vorticity_animation.mp4"
-=end
-
-# ---------------------
-# End of Script
-# ---------------------
+# Show the figure
+fig
